@@ -53,6 +53,8 @@ class beat_block_hammer(Base_Task):
             block_pose.p[1] + 0.05,
         ])
 
+        self.manipulated_obj = self.hammer
+
     def play_once(self):
         # Get the position of the block's functional point
         block_pose = self.block.get_functional_point(0, "pose").p

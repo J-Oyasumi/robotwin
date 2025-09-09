@@ -69,6 +69,8 @@ class Base_Task(gym.Env):
         self.dual_arm = kwags.get("dual_arm", True)
         self.eval_mode = kwags.get("eval_mode", False)
 
+        self.visualize_contact_point = kwags.get("visualize_contact_point", False)
+
         self.need_topp = True  # TODO
 
         # Random
@@ -251,7 +253,26 @@ class Base_Task(gym.Env):
         for point_light in point_lights:
             if self.random_light:
                 point_light[1] = [np.random.rand(), np.random.rand(), np.random.rand()]
-            self.point_light_lst.append(self.scene.add_point_light(point_light[0], point_light[1], shadow=shadow))
+            self.point_light_lst.append(
+                self.scene.add_point_light(
+                    point_light[0], point_light[1], shadow=shadow
+                )
+            )
+
+        if self.visualize_contact_point:
+            # Create a render material for the visualizer
+            viz_material = self.renderer.create_material()
+            viz_material.base_color = [0, 1, 0, 1.0]
+            # Create a visual marker for the contact point trajectory
+            builder = self.scene.create_actor_builder()
+            # Add a small, green, non-colliding sphere visual
+            builder.add_sphere_visual(radius=0.015, material=viz_material)
+            # Build it as a static object so it doesn't interfere with physics
+            self.contact_viz_sphere = builder.build_static(name="contact_viz_sphere")
+            # Hide it far away initially
+            self.contact_viz_sphere.set_pose(sapien.Pose(p=[100, 100, 100]))
+        else:
+            self.contact_viz_sphere = None
 
         # initialize viewer with camera position and orientation
         if self.render_freq:
@@ -433,6 +454,88 @@ class Base_Task(gym.Env):
         self.scene.update_render()
 
     # =========================================================== Basic APIs ===========================================================
+    # get 3D postion of contact points
+    def get_contact_point_pose(self):
+        return np.array(
+            self.manipulated_obj.get_contact_point(self.grasp_contact_point_id)
+        )
+
+    def get_contact_point_pose_2d(self, camera_name="head_camera"):
+        """
+        Get 2D coordinates of contact point in camera image space.
+        
+        Args:
+            camera_name: Name of the camera to project to (default: "head_camera")
+            
+        Returns:
+            dict: Contains 2D coordinates and validity flag
+                - "2d_coords": [x, y] coordinates in image space
+                - "valid": bool, whether the projection is valid (within image bounds)
+        """
+        try:
+            # Get 3D contact point position in world coordinates
+            contact_point_3d = self.get_contact_point_pose()
+            if contact_point_3d is None or len(contact_point_3d) < 3:
+                return {"2d_coords": [0, 0], "valid": False}
+            
+            # Get camera configuration
+            if not hasattr(self, 'cameras') or self.cameras is None:
+                return {"2d_coords": [0, 0], "valid": False}
+            
+            # Find the camera
+            camera = None
+            if camera_name == "head_camera" and hasattr(self.cameras, 'static_camera_list') and self.cameras.head_camera_id is not None:
+                camera = self.cameras.static_camera_list[self.cameras.head_camera_id]
+            elif hasattr(self.cameras, 'left_camera') and camera_name == "left_camera":
+                camera = self.cameras.left_camera
+            elif hasattr(self.cameras, 'right_camera') and camera_name == "right_camera":
+                camera = self.cameras.right_camera
+                
+            if camera is None:
+                return {"2d_coords": [0, 0], "valid": False}
+            
+            # Get camera intrinsic and extrinsic matrices
+            intrinsic_matrix = camera.get_intrinsic_matrix()  # 3x3 matrix
+            extrinsic_matrix = camera.get_extrinsic_matrix()  # 4x4 matrix (world to camera)
+            
+            # Convert 3D world point to homogeneous coordinates
+            point_3d_homo = np.append(contact_point_3d[:3], 1.0)  # [x, y, z, 1]
+            
+            # Transform to camera coordinates
+            point_camera_homo = extrinsic_matrix @ point_3d_homo  # 4x1 vector
+            point_camera = point_camera_homo[:3]  # [x, y, z] in camera space
+            
+            # Check if point is behind camera (z should be positive in camera space)
+            if point_camera[2] <= 0:
+                return {"2d_coords": [0, 0], "valid": False}
+            
+            # Project to image coordinates using intrinsic matrix
+            point_2d_homo = intrinsic_matrix @ point_camera  # 3x1 vector
+            
+            # Convert from homogeneous to 2D coordinates
+            if abs(point_2d_homo[2]) < 1e-6:  # Avoid division by zero
+                return {"2d_coords": [0, 0], "valid": False}
+                
+            x_2d = point_2d_homo[0] / point_2d_homo[2]
+            y_2d = point_2d_homo[1] / point_2d_homo[2]
+            
+            # Get image dimensions (assuming we can get this from camera config)
+            # Default to common camera resolution if not available
+            img_width = getattr(camera, 'width', 320)
+            img_height = getattr(camera, 'height', 240)
+            
+            # Check if coordinates are within image bounds
+            valid = (0 <= x_2d < img_width) and (0 <= y_2d < img_height)
+            
+            return {
+                "2d_coords": [float(x_2d), float(y_2d)], 
+                "valid": valid,
+                "depth": float(point_camera[2])  # Distance from camera
+            }
+            
+        except Exception as e:
+            print(f"Error in get_contact_point_pose_2d: {e}")
+            return {"2d_coords": [0, 0], "valid": False}
 
     def get_obs(self):
         self._update_render()
@@ -442,6 +545,7 @@ class Base_Task(gym.Env):
             "pointcloud": [],
             "joint_action": {},
             "endpose": {},
+            "contact_point": {},
         }
 
         pkl_dic["observation"] = self.cameras.get_config()
@@ -494,7 +598,15 @@ class Base_Task(gym.Env):
             pkl_dic["joint_action"]["vector"] = np.array(left_jointstate + right_jointstate)
         # pointcloud
         if self.data_type.get("pointcloud", False):
-            pkl_dic["pointcloud"] = self.cameras.get_pcd(self.data_type.get("conbine", False))
+            pkl_dic["pointcloud"] = self.cameras.get_pcd(
+                self.data_type.get("conbine", False)
+            )
+        # contact point 
+        if self.data_type.get("contact_point", False):
+            pkl_dic["contact_point"] = self.get_contact_point_pose()
+
+        if self.data_type.get("contact_point_2d", False):
+            pkl_dic["contact_point_2d"] = self.get_contact_point_pose_2d()
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
@@ -521,8 +633,32 @@ class Base_Task(gym.Env):
                         os.remove(directory + file)
 
         pkl_dic = self.get_obs()
-        save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)  # use cache
+
+        if self.visualize_contact_point and self.contact_viz_sphere is not None:
+            try:
+                contact_pos = pkl_dic.get("contact_point")
+            except Exception:
+                contact_pos = None
+
+            if contact_pos is not None and np.all(np.isfinite(contact_pos)):
+                self.contact_viz_sphere.set_pose(sapien.Pose(p=contact_pos[:3]))
+                self._update_render()
+                self.cameras.update_picture()
+
+                new_rgb_data = self.cameras.get_rgb()
+                if (
+                    "head_camera" in new_rgb_data
+                    and "head_camera" in pkl_dic["observation"]
+                ):
+                    pkl_dic["observation"]["head_camera"]["rgb"] = new_rgb_data[
+                        "head_camera"
+                    ]["rgb"]
+
+        save_pkl(self.folder_path["cache"] + f"{self.FRAME_IDX}.pkl", pkl_dic)
         self.FRAME_IDX += 1
+
+        if self.visualize_contact_point and self.contact_viz_sphere is not None:
+            self.contact_viz_sphere.set_pose(sapien.Pose(p=[100, 100, 100]))
 
     def save_traj_data(self, idx):
         file_path = os.path.join(self.save_dir, "_traj_data", f"episode{idx}.pkl")
@@ -1131,6 +1267,8 @@ class Base_Task(gym.Env):
         else:
             contact_point_id = actor.iter_contact_points()
 
+        self.grasp_contact_point_id = 0
+
         for i, _ in contact_point_id:
             pre_pose = self.get_grasp_pose(actor, arm_tag, contact_point_id=i, pre_dis=pre_dis)
             if pre_pose is None:
@@ -1157,6 +1295,7 @@ class Base_Task(gym.Env):
                 res_pre_pose = pre_pose
                 res_pose = pose
                 dis = now_dis
+                self.grasp_contact_point_id = i
 
         if dis_top_down < 0.15:
             return res_pre_top_down_pose, res_top_down_pose
@@ -1455,13 +1594,18 @@ class Base_Task(gym.Env):
 
         return True  # TODO: maybe need try error
 
-    def take_action(self, action, action_type:Literal['qpos', 'ee', 'delta_ee']='qpos'):  # action_type: qpos or ee
+    def take_action(self, action, action_type='qpos'):  # action_type: qpos or ee
         if self.take_action_cnt == self.step_lim or self.eval_success:
             return
 
         eval_video_freq = 1  # fixed
-        if (self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
-            self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
+        if ( self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
+            frame_image = self.now_obs["observation"]["head_camera"]["rgb"].copy()
+
+            if hasattr(self, "_draw_trajectory_on_image"):
+                frame_image = self._draw_trajectory_on_image(frame_image)
+
+            self.eval_video_ffmpeg.stdin.write(frame_image.tobytes())
 
         self.take_action_cnt += 1
         print(f"step: \033[92m{self.take_action_cnt} / {self.step_lim}\033[0m", end="\r")
@@ -1550,28 +1694,7 @@ class Base_Task(gym.Env):
                 topp_right_flag = False
                 right_n_step = 50  # fixed
         
-        elif action_type == 'ee' or action_type == 'delta_ee':
-            # ====================== delta_ee control ======================
-            if action_type == 'delta_ee':
-                now_left_action = self.get_arm_pose("left")
-                now_right_action = self.get_arm_pose("right")
-                def transfer_action(action, delta_action):
-                    action_mat = np.eye(4)
-                    delta_mat = np.eye(4)
-                    action_mat[:3, 3] = action[:3]
-                    action_mat[:3, :3] = t3d.quaternions.quat2mat(action[3:])
-                    delta_mat[:3, 3] = delta_action[:3]
-                    delta_mat[:3, :3] = t3d.quaternions.quat2mat(delta_action[3:])
-                    new_mat = action_mat @ delta_mat
-                    new_p = new_mat[:3, 3]
-                    new_q = t3d.quaternions.mat2quat(new_mat[:3, :3])
-                    return np.concatenate((new_p, new_q))
-                now_left_action = transfer_action(now_left_action, left_arm_actions[0])
-                now_right_action = transfer_action(now_right_action, right_arm_actions[0])
-                left_arm_actions = np.array([now_left_action])
-                right_arm_actions = np.array([now_right_action])
-            # ====================== end of delta_ee control ===============
-
+        elif action_type == 'ee':
             left_result = self.robot.left_plan_path(left_arm_actions[0])
             right_result = self.robot.right_plan_path(right_arm_actions[0])
             if left_result["status"] != "Success":
@@ -1652,12 +1775,9 @@ class Base_Task(gym.Env):
 
             self.scene.step()
             self._update_render()
-                
+
             if self.check_success():
                 self.eval_success = True
-                self.get_obs() # update obs
-                if (self.eval_video_path is not None):
-                    self.eval_video_ffmpeg.stdin.write(self.now_obs["observation"]["head_camera"]["rgb"].tobytes())
                 return
 
         self._update_render()
