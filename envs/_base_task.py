@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import sapien.core as sapien
@@ -70,6 +71,12 @@ class Base_Task(gym.Env):
         self.eval_mode = kwags.get("eval_mode", False)
 
         self.visualize_contact_point = kwags.get("visualize_contact_point", False)
+        
+        # Initialize 2D trajectory visualization
+        self.trajectory_2d_points = []
+        self.trajectory_coords_history = []  # Store x, y coordinates history
+        self.trajectory_config = kwags.get("trajectory_visualization", {})
+        self.show_trajectory = self.trajectory_config.get("enabled", False)
 
         self.need_topp = True  # TODO
 
@@ -537,6 +544,139 @@ class Base_Task(gym.Env):
             print(f"Error in get_contact_point_pose_2d: {e}")
             return {"2d_coords": [0, 0], "valid": False}
 
+    def _draw_trajectory_on_image(self, image, include_coordinate_plots=True):
+        """Draw 2D trajectory and create three-panel visualization: original video, X coordinate plot, Y coordinate plot"""
+        import cv2
+        import matplotlib
+        import matplotlib.pyplot as plt
+        matplotlib.use('Agg')  # Use non-interactive backend
+        
+        img = image.copy()
+        
+        # Only draw trajectory if enabled
+        if not self.show_trajectory:
+            return img
+        
+        # Get config parameters
+        camera_name = self.trajectory_config.get("camera_name", "head_camera")
+        max_points = self.trajectory_config.get("max_points", 50)
+        line_color = tuple(self.trajectory_config.get("line_color", [0, 255, 0]))
+        line_thickness = self.trajectory_config.get("line_thickness", 2)
+        point_color = tuple(self.trajectory_config.get("point_color", [0, 0, 255]))
+        point_radius = self.trajectory_config.get("point_radius", 5)
+        
+        # Update trajectory with current contact point
+        contact_2d = self.get_contact_point_pose_2d(camera_name)
+        if contact_2d["valid"]:
+            self.trajectory_2d_points.append(contact_2d["2d_coords"])
+            self.trajectory_coords_history.append(contact_2d["2d_coords"])
+            # Debug: Print coordinate information
+            if len(self.trajectory_coords_history) % 10 == 0:  # Print every 10th point
+                print(f"Recorded point {len(self.trajectory_coords_history)}: X={contact_2d['2d_coords'][0]:.2f}, Y={contact_2d['2d_coords'][1]:.2f}")
+            # Keep only last max_points
+            if len(self.trajectory_2d_points) > max_points:
+                self.trajectory_2d_points = self.trajectory_2d_points[-max_points:]
+            if len(self.trajectory_coords_history) > max_points:
+                self.trajectory_coords_history = self.trajectory_coords_history[-max_points:]
+        
+        # Draw trajectory on original image
+        if len(self.trajectory_2d_points) > 1:
+            # Only filter points that are completely outside the image bounds
+            # Allow points that are within our expected coordinate range (0-150, 0-250)
+            points = [(int(p[0]), int(p[1])) for p in self.trajectory_2d_points 
+                     if 0 <= p[0] < max(image.shape[1], 150) and 0 <= p[1] < max(image.shape[0], 250)]
+            
+            for i in range(1, len(points)):
+                cv2.line(img, points[i-1], points[i], line_color, line_thickness)
+            
+            if points:
+                cv2.circle(img, points[-1], point_radius, point_color, -1)
+        
+        # Create three-panel visualization if requested and we have history
+        if include_coordinate_plots and len(self.trajectory_coords_history) > 1:
+            # Extract x and y coordinates
+            x_coords = [coord[0] for coord in self.trajectory_coords_history]
+            y_coords = [coord[1] for coord in self.trajectory_coords_history]
+            time_steps = list(range(len(x_coords)))
+            
+            # Debug: Print coordinate range information
+            if len(x_coords) > 0:
+                print(f"Plotting coordinates - X range: {min(x_coords):.2f} to {max(x_coords):.2f}, Y range: {min(y_coords):.2f} to {max(y_coords):.2f}")
+                print(f"Total points to plot: {len(x_coords)}")
+            
+            # Get image dimensions
+            img_height, img_width = img.shape[:2]
+            plot_width = img_width  # Each plot has same width as original image
+            plot_height = img_height
+            
+            # Create X coordinate plot
+            fig_x, ax_x = plt.subplots(1, 1, figsize=(plot_width/100, plot_height/100), dpi=100)
+            ax_x.plot(time_steps, x_coords, 'r-', linewidth=2)
+            ax_x.set_title('X Coordinate', fontsize=12, fontweight='bold')
+            ax_x.set_ylabel('X (pixels)', fontsize=10)
+            ax_x.grid(True, alpha=0.3)
+            ax_x.set_xlim(0, 150)  # Fixed X range for X coordinate plot (0-150)
+            ax_x.set_ylim(0, 320)  # Fixed Y range for X coordinate plot (0-320)
+            ax_x.tick_params(labelsize=8)
+            
+            # Convert X plot to image
+            fig_x.canvas.draw()
+            try:
+                buf_x = fig_x.canvas.buffer_rgba()
+                plot_x_img = np.asarray(buf_x)[:, :, :3]
+            except AttributeError:
+                try:
+                    plot_x_img = np.frombuffer(fig_x.canvas.tostring_rgb(), dtype=np.uint8)
+                    plot_x_img = plot_x_img.reshape(fig_x.canvas.get_width_height()[::-1] + (3,))
+                except AttributeError:
+                    plot_x_img = np.zeros((plot_height, plot_width, 3), dtype=np.uint8)
+                    cv2.putText(plot_x_img, "X Plot Error", (50, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            plt.close(fig_x)
+            
+            # Create Y coordinate plot
+            fig_y, ax_y = plt.subplots(1, 1, figsize=(plot_width/100, plot_height/100), dpi=100)
+            ax_y.plot(time_steps, y_coords, 'b-', linewidth=2)
+            ax_y.set_title('Y Coordinate', fontsize=12, fontweight='bold')
+            ax_y.set_ylabel('Y (pixels)', fontsize=10)
+            ax_y.grid(True, alpha=0.3)
+            ax_y.set_xlim(0, 150)  # Fixed X range for Y coordinate plot (0-150)
+            ax_y.set_ylim(0, 240)  # Fixed Y range for Y coordinate plot (0-240)
+            ax_y.tick_params(labelsize=8)
+            
+            # Convert Y plot to image
+            fig_y.canvas.draw()
+            try:
+                buf_y = fig_y.canvas.buffer_rgba()
+                plot_y_img = np.asarray(buf_y)[:, :, :3]
+            except AttributeError:
+                try:
+                    plot_y_img = np.frombuffer(fig_y.canvas.tostring_rgb(), dtype=np.uint8)
+                    plot_y_img = plot_y_img.reshape(fig_y.canvas.get_width_height()[::-1] + (3,))
+                except AttributeError:
+                    plot_y_img = np.zeros((plot_height, plot_width, 3), dtype=np.uint8)
+                    cv2.putText(plot_y_img, "Y Plot Error", (50, plot_height//2), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+            plt.close(fig_y)
+            
+            # Resize plots to match original image dimensions
+            plot_x_resized = cv2.resize(plot_x_img, (plot_width, plot_height))
+            plot_y_resized = cv2.resize(plot_y_img, (plot_width, plot_height))
+            
+            # Convert RGB to BGR for OpenCV
+            plot_x_bgr = cv2.cvtColor(plot_x_resized, cv2.COLOR_RGB2BGR)
+            plot_y_bgr = cv2.cvtColor(plot_y_resized, cv2.COLOR_RGB2BGR)
+            
+            # Horizontally concatenate: original image + X plot + Y plot
+            combined_img = np.hstack([img, plot_x_bgr, plot_y_bgr])
+            
+            return combined_img
+        
+        return img
+
+    def reset_trajectory_2d(self):
+        """Reset trajectory at episode start"""
+        self.trajectory_2d_points = []
+        self.trajectory_coords_history = []
+
     def get_obs(self):
         self._update_render()
         self.cameras.update_picture()
@@ -625,6 +765,9 @@ class Base_Task(gym.Env):
 
         if self.FRAME_IDX == 0:
             self.folder_path = {"cache": f"{self.save_dir}/.cache/episode{self.ep_num}/"}
+            # Reset trajectory at episode start
+            if self.show_trajectory:
+                self.reset_trajectory_2d()
 
             for directory in self.folder_path.values():  # remove previous data
                 if os.path.exists(directory):
@@ -633,6 +776,18 @@ class Base_Task(gym.Env):
                         os.remove(directory + file)
 
         pkl_dic = self.get_obs()
+        
+        # Apply 2D trajectory visualization to RGB data if enabled
+        if self.show_trajectory and "observation" in pkl_dic:
+            camera_name = self.trajectory_config.get("camera_name", "head_camera")
+            if camera_name in pkl_dic["observation"] and "rgb" in pkl_dic["observation"][camera_name]:
+                # Store original image for video processing
+                original_rgb = pkl_dic["observation"][camera_name]["rgb"]
+                # Draw trajectory with three-panel visualization (original + X plot + Y plot)
+                rgb_with_trajectory = self._draw_trajectory_on_image(original_rgb, include_coordinate_plots=True)
+                
+                # Use the three-panel combined image for video
+                pkl_dic["observation"][camera_name]["rgb"] = rgb_with_trajectory
 
         if self.visualize_contact_point and self.contact_viz_sphere is not None:
             try:
@@ -692,9 +847,10 @@ class Base_Task(gym.Env):
         RED = "\033[91m"
         RESET = "\033[0m"
         try:
+            import shutil
             shutil.rmtree(folder_path)
             print(f"{GREEN}Folder {folder_path} deleted successfully.{RESET}")
-        except OSError as e:
+        except OSError:
             print(f"{RED}Error: {folder_path} is not empty or does not exist.{RESET}")
 
     def set_instruction(self, instruction=None):
@@ -968,7 +1124,7 @@ class Base_Task(gym.Env):
             if not left_success or not right_success:
                 self.plan_success = False
                 # return TODO
-        except Exception as e:
+        except Exception:
             if left_result is None or right_result is None:
                 self.plan_success = False
                 return  # TODO
@@ -1602,8 +1758,9 @@ class Base_Task(gym.Env):
         if ( self.eval_video_path is not None and self.take_action_cnt % eval_video_freq == 0):
             frame_image = self.now_obs["observation"]["head_camera"]["rgb"].copy()
 
-            if hasattr(self, "_draw_trajectory_on_image"):
-                frame_image = self._draw_trajectory_on_image(frame_image)
+            # Apply 2D trajectory visualization with coordinate plots to eval video if enabled
+            if self.show_trajectory:
+                frame_image = self._draw_trajectory_on_image(frame_image, include_coordinate_plots=True)
 
             self.eval_video_ffmpeg.stdin.write(frame_image.tobytes())
 
@@ -1669,7 +1826,7 @@ class Base_Task(gym.Env):
                 left_result = dict()
                 left_result["position"], left_result["velocity"] = left_pos, left_vel
                 left_n_step = left_result["position"].shape[0]
-            except Exception as e:
+            except Exception:
                 # print("left arm TOPP error: ", e)
                 topp_left_flag = False
                 left_n_step = 50  # fixed
@@ -1685,7 +1842,7 @@ class Base_Task(gym.Env):
                 right_result = dict()
                 right_result["position"], right_result["velocity"] = right_pos, right_vel
                 right_n_step = right_result["position"].shape[0]
-            except Exception as e:
+            except Exception:
                 # print("right arm TOPP error: ", e)
                 topp_right_flag = False
                 right_n_step = 50  # fixed
