@@ -71,12 +71,18 @@ class Base_Task(gym.Env):
         self.eval_mode = kwags.get("eval_mode", False)
 
         self.visualize_contact_point = kwags.get("visualize_contact_point", False)
-        
+        self.visualize_ee_2d = kwags.get("visualize_ee_2d", False)
+
         # Initialize 2D trajectory visualization
         self.trajectory_2d_points = []
         self.trajectory_coords_history = []  # Store x, y coordinates history
         self.trajectory_config = kwags.get("trajectory_visualization", {})
         self.show_trajectory = self.trajectory_config.get("enabled", False)
+
+        # Initialize end-effector 2D trajectory visualization
+        self.left_ee_2d_points = []
+        self.right_ee_2d_points = []
+        self.ee_2d_max_points = 50  # Maximum number of points to keep in trajectory
 
         self.need_topp = True  # TODO
 
@@ -470,10 +476,10 @@ class Base_Task(gym.Env):
     def get_contact_point_pose_2d(self, camera_name="head_camera"):
         """
         Get 2D coordinates of contact point in camera image space.
-        
+
         Args:
             camera_name: Name of the camera to project to (default: "head_camera")
-            
+
         Returns:
             dict: Contains 2D coordinates and validity flag
                 - "2d_coords": [x, y] coordinates in image space
@@ -484,11 +490,11 @@ class Base_Task(gym.Env):
             contact_point_3d = self.get_contact_point_pose()
             if contact_point_3d is None or len(contact_point_3d) < 3:
                 return {"2d_coords": [0, 0], "valid": False}
-            
+
             # Get camera configuration
             if not hasattr(self, 'cameras') or self.cameras is None:
                 return {"2d_coords": [0, 0], "valid": False}
-            
+
             # Find the camera
             camera = None
             if camera_name == "head_camera" and hasattr(self.cameras, 'static_camera_list') and self.cameras.head_camera_id is not None:
@@ -497,52 +503,145 @@ class Base_Task(gym.Env):
                 camera = self.cameras.left_camera
             elif hasattr(self.cameras, 'right_camera') and camera_name == "right_camera":
                 camera = self.cameras.right_camera
-                
+
             if camera is None:
                 return {"2d_coords": [0, 0], "valid": False}
-            
+
             # Get camera intrinsic and extrinsic matrices
             intrinsic_matrix = camera.get_intrinsic_matrix()  # 3x3 matrix
             extrinsic_matrix = camera.get_extrinsic_matrix()  # 4x4 matrix (world to camera)
-            
+
             # Convert 3D world point to homogeneous coordinates
             point_3d_homo = np.append(contact_point_3d[:3], 1.0)  # [x, y, z, 1]
-            
+
             # Transform to camera coordinates
             point_camera_homo = extrinsic_matrix @ point_3d_homo  # 4x1 vector
             point_camera = point_camera_homo[:3]  # [x, y, z] in camera space
-            
+
             # Check if point is behind camera (z should be positive in camera space)
             if point_camera[2] <= 0:
                 return {"2d_coords": [0, 0], "valid": False}
-            
+
             # Project to image coordinates using intrinsic matrix
             point_2d_homo = intrinsic_matrix @ point_camera  # 3x1 vector
-            
+
             # Convert from homogeneous to 2D coordinates
             if abs(point_2d_homo[2]) < 1e-6:  # Avoid division by zero
                 return {"2d_coords": [0, 0], "valid": False}
-                
+
             x_2d = point_2d_homo[0] / point_2d_homo[2]
             y_2d = point_2d_homo[1] / point_2d_homo[2]
-            
+
             # Get image dimensions (assuming we can get this from camera config)
             # Default to common camera resolution if not available
             img_width = getattr(camera, 'width', 320)
             img_height = getattr(camera, 'height', 240)
-            
+
             # Check if coordinates are within image bounds
             valid = (0 <= x_2d < img_width) and (0 <= y_2d < img_height)
-            
+
             return {
-                "2d_coords": [float(x_2d), float(y_2d)], 
+                "2d_coords": [float(x_2d), float(y_2d)],
                 "valid": valid,
                 "depth": float(point_camera[2])  # Distance from camera
             }
-            
+
         except Exception as e:
             print(f"Error in get_contact_point_pose_2d: {e}")
             return {"2d_coords": [0, 0], "valid": False}
+
+    def get_ee_pose_2d(self, camera_name="head_camera"):
+        """
+        Get 2D coordinates of end-effector (left and right) in camera image space.
+
+        Args:
+            camera_name: Name of the camera to project to (default: "head_camera")
+
+        Returns:
+            dict: Contains 2D coordinates for both left and right end-effectors
+                - "left_ee_2d": {"2d_coords": [x, y], "valid": bool, "depth": float}
+                - "right_ee_2d": {"2d_coords": [x, y], "valid": bool, "depth": float}
+        """
+        result = {
+            "left_ee_2d": {"2d_coords": [0, 0], "valid": False},
+            "right_ee_2d": {"2d_coords": [0, 0], "valid": False}
+        }
+
+        try:
+            # Get camera configuration
+            if not hasattr(self, 'cameras') or self.cameras is None:
+                return result
+
+            # Find the camera
+            camera = None
+            if camera_name == "head_camera" and hasattr(self.cameras, 'static_camera_list') and self.cameras.head_camera_id is not None:
+                camera = self.cameras.static_camera_list[self.cameras.head_camera_id]
+            elif hasattr(self.cameras, 'left_camera') and camera_name == "left_camera":
+                camera = self.cameras.left_camera
+            elif hasattr(self.cameras, 'right_camera') and camera_name == "right_camera":
+                camera = self.cameras.right_camera
+
+            if camera is None:
+                return result
+
+            # Get camera intrinsic and extrinsic matrices
+            intrinsic_matrix = camera.get_intrinsic_matrix()  # 3x3 matrix
+            extrinsic_matrix = camera.get_extrinsic_matrix()  # 4x4 matrix (world to camera)
+
+            # Function to project 3D point to 2D
+            def project_to_2d(point_3d):
+                if point_3d is None or len(point_3d) < 3:
+                    return {"2d_coords": [0, 0], "valid": False}
+
+                # Convert 3D world point to homogeneous coordinates
+                point_3d_homo = np.append(point_3d[:3], 1.0)  # [x, y, z, 1]
+
+                # Transform to camera coordinates
+                point_camera_homo = extrinsic_matrix @ point_3d_homo  # 4x1 vector
+                point_camera = point_camera_homo[:3]  # [x, y, z] in camera space
+
+                # Check if point is behind camera (z should be positive in camera space)
+                if point_camera[2] <= 0:
+                    return {"2d_coords": [0, 0], "valid": False}
+
+                # Project to image coordinates using intrinsic matrix
+                point_2d_homo = intrinsic_matrix @ point_camera  # 3x1 vector
+
+                # Convert from homogeneous to 2D coordinates
+                if abs(point_2d_homo[2]) < 1e-6:  # Avoid division by zero
+                    return {"2d_coords": [0, 0], "valid": False}
+
+                x_2d = point_2d_homo[0] / point_2d_homo[2]
+                y_2d = point_2d_homo[1] / point_2d_homo[2]
+
+                # Get image dimensions
+                img_width = getattr(camera, 'width', 320)
+                img_height = getattr(camera, 'height', 240)
+
+                # Check if coordinates are within image bounds
+                valid = (0 <= x_2d < img_width) and (0 <= y_2d < img_height)
+
+                return {
+                    "2d_coords": [float(x_2d), float(y_2d)],
+                    "valid": valid,
+                    "depth": float(point_camera[2])
+                }
+
+            # Get left end-effector 3D position
+            left_ee_pose = self.robot.get_left_ee_pose()
+            if left_ee_pose is not None:
+                result["left_ee_2d"] = project_to_2d(left_ee_pose[:3])
+
+            # Get right end-effector 3D position
+            right_ee_pose = self.robot.get_right_ee_pose()
+            if right_ee_pose is not None:
+                result["right_ee_2d"] = project_to_2d(right_ee_pose[:3])
+
+            return result
+
+        except Exception as e:
+            print(f"Error in get_ee_pose_2d: {e}")
+            return result
 
     def _draw_trajectory_on_image(self, image, include_coordinate_plots=True):
         """Draw 2D trajectory and create three-panel visualization: original video, X coordinate plot, Y coordinate plot"""
@@ -676,6 +775,79 @@ class Base_Task(gym.Env):
         """Reset trajectory at episode start"""
         self.trajectory_2d_points = []
         self.trajectory_coords_history = []
+        self.left_ee_2d_points = []
+        self.right_ee_2d_points = []
+
+    def _draw_ee_trajectory_on_image(self, image, camera_name="head_camera"):
+        """
+        Draw end-effector 2D trajectories on the image.
+        Left EE in blue, Right EE in red.
+
+        Args:
+            image: Input RGB image
+            camera_name: Camera to use for projection
+
+        Returns:
+            Image with EE trajectories drawn
+        """
+        if not self.visualize_ee_2d:
+            return image
+
+        import cv2
+        img = image.copy()
+
+        # Get current EE positions in 2D
+        ee_2d_data = self.get_ee_pose_2d(camera_name)
+
+        # Update left EE trajectory
+        if ee_2d_data["left_ee_2d"]["valid"]:
+            left_coords = ee_2d_data["left_ee_2d"]["2d_coords"]
+            self.left_ee_2d_points.append(left_coords)
+            if len(self.left_ee_2d_points) > self.ee_2d_max_points:
+                self.left_ee_2d_points = self.left_ee_2d_points[-self.ee_2d_max_points:]
+
+        # Update right EE trajectory
+        if ee_2d_data["right_ee_2d"]["valid"]:
+            right_coords = ee_2d_data["right_ee_2d"]["2d_coords"]
+            self.right_ee_2d_points.append(right_coords)
+            if len(self.right_ee_2d_points) > self.ee_2d_max_points:
+                self.right_ee_2d_points = self.right_ee_2d_points[-self.ee_2d_max_points:]
+
+        # Draw left EE trajectory (blue)
+        if len(self.left_ee_2d_points) > 1:
+            points = [(int(p[0]), int(p[1])) for p in self.left_ee_2d_points
+                     if 0 <= p[0] < img.shape[1] and 0 <= p[1] < img.shape[0]]
+            for i in range(1, len(points)):
+                # Draw line with gradient effect (older points are more transparent)
+                alpha = i / len(points)
+                thickness = max(1, int(2 * alpha))
+                cv2.line(img, points[i-1], points[i], (255, 0, 0), thickness)  # Blue for left
+            if points:
+                # Draw current position as a larger circle
+                cv2.circle(img, points[-1], 6, (255, 0, 0), -1)  # Blue filled circle
+                cv2.circle(img, points[-1], 7, (255, 255, 255), 1)  # White outline
+                # Add label
+                cv2.putText(img, "L", (points[-1][0] - 15, points[-1][1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        # Draw right EE trajectory (red)
+        if len(self.right_ee_2d_points) > 1:
+            points = [(int(p[0]), int(p[1])) for p in self.right_ee_2d_points
+                     if 0 <= p[0] < img.shape[1] and 0 <= p[1] < img.shape[0]]
+            for i in range(1, len(points)):
+                # Draw line with gradient effect
+                alpha = i / len(points)
+                thickness = max(1, int(2 * alpha))
+                cv2.line(img, points[i-1], points[i], (0, 0, 255), thickness)  # Red for right
+            if points:
+                # Draw current position as a larger circle
+                cv2.circle(img, points[-1], 6, (0, 0, 255), -1)  # Red filled circle
+                cv2.circle(img, points[-1], 7, (255, 255, 255), 1)  # White outline
+                # Add label
+                cv2.putText(img, "R", (points[-1][0] + 10, points[-1][1] - 10),
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+
+        return img
 
     def get_obs(self):
         self._update_render()
@@ -741,12 +913,16 @@ class Base_Task(gym.Env):
             pkl_dic["pointcloud"] = self.cameras.get_pcd(
                 self.data_type.get("conbine", False)
             )
-        # contact point 
+        # contact point
         if self.data_type.get("contact_point", False):
             pkl_dic["contact_point"] = self.get_contact_point_pose()
 
         if self.data_type.get("contact_point_2d", False):
             pkl_dic["contact_point_2d"] = self.get_contact_point_pose_2d()
+
+        # end-effector 2d
+        if self.data_type.get("ee_2d", False):
+            pkl_dic["ee_2d"] = self.get_ee_pose_2d()
 
         self.now_obs = deepcopy(pkl_dic)
         return pkl_dic
@@ -776,7 +952,7 @@ class Base_Task(gym.Env):
                         os.remove(directory + file)
 
         pkl_dic = self.get_obs()
-        
+
         # Apply 2D trajectory visualization to RGB data if enabled
         if self.show_trajectory and "observation" in pkl_dic:
             camera_name = self.trajectory_config.get("camera_name", "head_camera")
@@ -785,9 +961,20 @@ class Base_Task(gym.Env):
                 original_rgb = pkl_dic["observation"][camera_name]["rgb"]
                 # Draw trajectory with three-panel visualization (original + X plot + Y plot)
                 rgb_with_trajectory = self._draw_trajectory_on_image(original_rgb, include_coordinate_plots=True)
-                
+
                 # Use the three-panel combined image for video
                 pkl_dic["observation"][camera_name]["rgb"] = rgb_with_trajectory
+
+        # Apply end-effector 2D trajectory visualization if enabled
+        if self.visualize_ee_2d and "observation" in pkl_dic:
+            camera_name = "head_camera"  # Default to head camera for EE visualization
+            if camera_name in pkl_dic["observation"] and "rgb" in pkl_dic["observation"][camera_name]:
+                # Draw EE trajectories on the image
+                rgb_with_ee = self._draw_ee_trajectory_on_image(
+                    pkl_dic["observation"][camera_name]["rgb"],
+                    camera_name=camera_name
+                )
+                pkl_dic["observation"][camera_name]["rgb"] = rgb_with_ee
 
         if self.visualize_contact_point and self.contact_viz_sphere is not None:
             try:
@@ -1761,6 +1948,10 @@ class Base_Task(gym.Env):
             # Apply 2D trajectory visualization with coordinate plots to eval video if enabled
             if self.show_trajectory:
                 frame_image = self._draw_trajectory_on_image(frame_image, include_coordinate_plots=True)
+
+            # Apply end-effector 2D trajectory visualization to eval video if enabled
+            if self.visualize_ee_2d:
+                frame_image = self._draw_ee_trajectory_on_image(frame_image, camera_name="head_camera")
 
             self.eval_video_ffmpeg.stdin.write(frame_image.tobytes())
 
